@@ -1,0 +1,2 @@
+Model,R2_marginal,R2_conditional,RMSE,AIC,Deviance_explained
+LMM (linear mixed-effects),0.11763296303544825,0.1446208110034801,0.18296407051919245,-7472.512800585429,NA
