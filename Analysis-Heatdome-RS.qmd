@@ -1,0 +1,428 @@
+---
+title: "Analysis-Heatdome-RS"
+description: "Heatdome RS analysis"
+author: "Aji John and Kavya Pradhan"
+format: html
+editor: visual
+---
+
+# Background
+
+PlanetScope heatdome signature in forests analysis (Ellsworth Preserve)
+
+# Load libraries
+
+```{r}
+library(tidyverse)
+library(mgcv)
+library(gratia)
+library(lme4)
+library(emmeans)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(forcats)
+library(stringr)
+library(readr)
+library(ggeffects) 
+library(broom.mixed)
+library(tidyverse)
+library(broom)
+```
+
+# Load and merge data
+
+```{r}
+
+df <- read_csv("./data/sweep/cv_combined_SR_ells_harmonized_2017to2024NDVI.csv")
+meta <- read_csv("./data/SiteMetadata.csv")
+df <- left_join(df, meta, by = "Name")
+df$TRT[df$Name == "OG-1"] <- "OLD_GROWTH"
+df$TRT[df$Name == "CC-1"] <- "CLEARCUT"
+
+# Clean and format
+df <- df %>%
+  mutate(
+    Date = as.Date(Date),
+    Year = lubridate::year(Date),
+    DOY = lubridate::yday(Date),
+    Period = case_when(
+      Year < 2021 ~ "Pre2021",
+      Year == 2021 ~ "2021",
+      Year > 2021 ~ "Post2021"
+    )
+  ) %>%
+  filter(!is.na(ndvi_mean), cloud_cover <= 0.15)
+
+# Convert to factors
+df$TRT <- as.factor(df$TRT)
+df$Period <- factor(df$Period, levels = c("Pre2021", "2021", "Post2021"))
+```
+
+
+# Linear effects
+```{r}
+# Table 1: Year-wise correlation 
+yearwise_summary <- df %>%
+  group_by(Year) %>%
+  nest() %>%
+  mutate(
+    model = map(data, ~lm(ndvi_mean ~ DOY, data = .x)),
+    summary = map(model, glance),
+    tidy = map(model, tidy),
+    R = map_dbl(data, ~cor(.x$DOY, .x$ndvi_mean, use = "complete.obs")),
+    p_value = map_dbl(summary, "p.value"),
+    slope = map_dbl(tidy, ~.x$estimate[.x$term == "DOY"]),
+    trend = case_when(
+      R < -0.2 ~ "Suppression",
+      R > 0.2 ~ "Greening",
+      TRUE ~ "Stable"
+    )
+  ) %>%
+  select(Year, R, slope, p_value, trend)
+
+write_csv(yearwise_summary, "./Manuscript/tables/Table1_NDVI_DOY_yearwise_summary.csv")
+```
+
+
+
+# GAM
+```{r}
+# --- GAM Model ---
+gam_mod <- gam(ndvi_mean ~ s(DOY, by = interaction(TRT, Period), k = 10) + TRT + Period,
+               data = df, method = "REML")
+
+# visual check
+gam.check(gam_mod)
+summary_gam <- summary(gam_mod)
+
+
+# Export GAM summary table (edf, F, p)
+gam_terms <- summary_gam$s.table %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "Term") %>%
+  rename(edf = edf, F_value = `F`, p_value = `p-value`)
+write_csv(gam_terms, "./Manuscript/tables/Table2_GAM_term_summary.csv")
+
+# Model performance: AIC, R2, deviance explained, RMSE
+model_stats <- tibble(
+  AIC = AIC(gam_mod),
+  R2_adjusted = summary_gam$r.sq,
+  Deviance_explained = summary_gam$dev.expl,
+  RMSE = sqrt(mean(residuals(gam_mod)^2))
+)
+write_csv(model_stats, "./Manuscript/tables/Table2_GAM_model_performance.csv")
+
+# Predict and plot fitted GAM values
+ndvi_preds <- df %>%
+  mutate(predicted = predict(gam_mod, newdata = ., type = "response"))
+
+fit_plot <- ggplot(ndvi_preds, aes(x = DOY, y = ndvi_mean, color = Period)) +
+  geom_point(alpha = 0.3) +
+  geom_line(aes(y = predicted), size = 1) +
+  facet_wrap(~ TRT, scales = "free_y") +
+  labs(title = "",
+       x = "Day of Year (DOY)", y = "Mean NDVI") +
+  theme_minimal(base_size = 28)
+
+# Save the plot
+ggsave("./Manuscript/figs/Fig4-ndvi_trend_fits_by_treatment_period.png", plot = fit_plot, width = 12, height = 8)
+```
+
+# Q2 - Trajectory of recovery using GAM
+```{r}
+# Tidy smooths with CIs on the response scale
+sm <- smooth_estimates(gam_mod, n = 200) %>%
+  add_confint() %>%                           # adds `lower`, `upper`
+  filter(str_detect(.smooth, "^s\\(DOY\\)")) %>%
+  # parse Treatment & Period from names like "s(DOY):OLD_GROWTH.2021"
+  mutate(
+    Treatment = sub("^s\\(DOY\\):([^\\.]+)\\..*$", "\\1", .smooth),
+    Period    = sub("^s\\(DOY\\):[^\\.]+\\.(.*)$", "\\1", .smooth),
+    Period    = factor(Period, levels = c("Pre2021","2021","Post2021")),
+    Treatment = factor(Treatment, levels = c("OLD_GROWTH","CON","THIN","CLEARCUT")),
+    est       = ifelse(!is.null(.data$.estimate), .data$.estimate, NA_real_)  # alias
+  )
+
+
+sm_fix <- sm %>%
+  # keep only the DOY smooths
+  filter(str_detect(.smooth, "^s\\(DOY\\)")) %>%
+  # parse Treatment & Period from the interaction factor column
+  mutate(
+    grp = as.character(`interaction(TRT, Period)`),
+    Treatment = str_replace(grp, "\\..*$", ""),
+    Period    = str_replace(grp, "^.*\\.", ""),
+    Period    = factor(Period, levels = c("Pre2021","2021","Post2021")),
+    Treatment = factor(Treatment, levels = c("OLD_GROWTH","CON","THIN","CLEARCUT"))
+  )
+
+p <- ggplot(
+  sm_fix,
+  aes(x = DOY, y = .estimate,
+      ymin = .lower_ci, ymax = .upper_ci,
+      color = Treatment, fill = Treatment)
+) +
+  geom_ribbon(alpha = 0.15, linewidth = 0) +
+  geom_line(linewidth = 0.9) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  facet_wrap(~ Period, nrow = 1) +
+  labs(
+    x = "Day of Year",
+    y = "Partial effect of DOY on NDVI",
+    title = ""
+  ) +
+  theme_minimal(base_size = 24) +
+  theme(legend.position = "top")
+
+ggsave("./Manuscript/figs/Fig5-gam_smooths_by_treatment_period-revised.png",
+       p, width = 10, height = 8, dpi = 300)
+```
+
+
+# LMM (Table 4)
+
+```{r}
+# LMM (hierarchical)
+lmm <- lmer(ndvi_mean ~ DOY * TRT * Period + (1 | Name) + (1 | Year), data = df)
+lmm_rmse <- sqrt(mean(residuals(lmm)^2))
+# returns marginal/conditional R2
+lmm_r2   <- performance::r2(lmm) 
+lmm_stats <- tibble::tibble(
+  Model = "LMM (linear mixed-effects)",
+  R2_marginal = lmm_r2$R2_marginal,
+  R2_conditional = lmm_r2$R2_conditional,
+  RMSE = lmm_rmse,
+  AIC = AIC(lmm),
+  Deviance_explained = NA_real_
+)
+write_csv(lmm_stats, "./Manuscript/tables/LMM_model_performance.csv")
+
+summary_lmm_table <- tidy(lmm, effects = "fixed")
+write.csv(summary_lmm_table,
+          file = "./Manuscript/tables/Table3-lmm_fixed_effects_summary.csv",
+          row.names = FALSE)
+
+
+```
+
+# LMM prediction and plotting
+```{r}
+# Generate fixed-effect predictions
+preds <- ggpredict(lmm, terms = c("DOY [all]", "TRT", "Period"))
+
+# Plot
+ggplot(preds, aes(x = x, y = predicted, color = group, linetype = facet)) +
+  geom_line(size = 1.2) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high, fill = group), alpha = 0.15, color = NA) +
+  facet_wrap(~facet, nrow = 1) +
+  labs(
+    x = "Day of Year (DOY)",
+    y = "Predicted NDVI (LMM fit)",
+    color = "Treatment",
+    fill = "Treatment",
+    title = ""
+  ) +
+  theme_minimal(base_size = 18) +
+  theme(legend.position = "top")
+ # Save the plot
+ggsave("./Manuscript/figs/Fig6-lmmpredictedtrajbytreat.png", width = 12, height = 6, dpi = 300)
+ 
+```
+
+
+# Supplement
+
+
+# Marginal effects
+
+```{r}
+library(dplyr)
+library(stringr)
+library(readr)
+library(gratia)
+
+#    Get partial effects (smooth estimates) on a dense DOY grid
+#    n increases resolution, but using 400
+sm <- gratia::smooth_estimates(gam_mod, n = 400)
+
+# Add 95% confidence intervals manually
+sm <- sm %>%
+  mutate(
+    .lower_ci = .estimate - 1.96 * .se,
+    .upper_ci = .estimate + 1.96 * .se
+  )
+
+# Keep only the DOY-by-interaction smooths
+sm_doy <- sm %>%
+  filter(str_detect(.smooth, "^s\\(DOY\\):interaction")) %>%
+  # Parse Treatment (between ')' and '.') and Period (after last '.')
+  mutate(
+    Treatment = sub("\\..*$", "", sub("^.*\\)", "", .smooth)),
+    Period    = sub("^.*\\.", "", .smooth)
+  ) %>%
+  # Ensure correct factor ordering if you use it elsewhere
+  mutate(
+    Treatment = factor(Treatment, levels = c("OLD_GROWTH","CON","THIN","CLEARCUT")),
+    Period    = factor(Period,    levels = c("Pre2021","2021","Post2021"))
+  )
+
+# Compute numeric derivatives (finite differences) per group
+# We use central differences where possible, falling back to forward/backward at edges
+sm_deriv <- sm_doy %>%
+  group_by(Treatment, Period) %>%
+  arrange(DOY, .by_group = TRUE) %>%
+  mutate(
+    # central difference for interior points
+    deriv = (lead(.estimate) - lag(.estimate)) / (lead(DOY) - lag(DOY)),
+    # edges: forward/backward differences
+    deriv = ifelse(is.na(deriv) & !is.na(lead(.estimate)),
+                   (lead(.estimate) - .estimate) / (lead(DOY) - DOY), deriv),
+    deriv = ifelse(is.na(deriv) & !is.na(lag(.estimate)),
+                   (.estimate - lag(.estimate)) / (DOY - lag(DOY)), deriv),
+
+    # Do the same to approximate 95% CI bounds on the derivative
+    deriv_upper = (lead(.upper_ci) - lag(.upper_ci)) / (lead(DOY) - lag(DOY)),
+    deriv_upper = ifelse(is.na(deriv_upper) & !is.na(lead(.upper_ci)),
+                         (lead(.upper_ci) - .upper_ci) / (lead(DOY) - DOY), deriv_upper),
+    deriv_upper = ifelse(is.na(deriv_upper) & !is.na(lag(.upper_ci)),
+                         (.upper_ci - lag(.upper_ci)) / (DOY - lag(DOY)), deriv_upper),
+
+    deriv_lower = (lead(.lower_ci) - lag(.lower_ci)) / (lead(DOY) - lag(DOY)),
+    deriv_lower = ifelse(is.na(deriv_lower) & !is.na(lead(.lower_ci)),
+                         (lead(.lower_ci) - .lower_ci) / (lead(DOY) - DOY), deriv_lower),
+    deriv_lower = ifelse(is.na(deriv_lower) & !is.na(lag(.lower_ci)),
+                         (.lower_ci - lag(.lower_ci)) / (DOY - lag(DOY)), deriv_lower)
+  ) %>%
+  ungroup()
+
+# Summarize marginal effects (derivatives) by Treatment × Period
+derivs_summary <- sm_deriv %>%
+  group_by(Treatment, Period) %>%
+  summarise(
+    mean_slope = mean(deriv, na.rm = TRUE),
+    min_slope  = min(deriv, na.rm = TRUE),
+    max_slope  = max(deriv, na.rm = TRUE),
+    lower_95   = mean(deriv_lower, na.rm = TRUE),
+    upper_95   = mean(deriv_upper, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Save the table
+write_csv(derivs_summary, "./Manuscript/tables/Supplement-TableA1_GAM_marginal_effects_final.csv")
+
+# Quick check
+print(derivs_summary)
+```
+
+# Assessing the rate of NDVI change across the treatments
+
+```{r}
+
+# We have sm_deriv from the previous step
+# Plot marginal (derivative) effects of DOY on NDVI
+p_marginal <- ggplot(sm_deriv, aes(x = DOY, y = deriv,
+                                   color = Treatment, fill = Treatment)) +
+  geom_ribbon(aes(ymin = deriv_lower, ymax = deriv_upper),
+              alpha = 0.15, linewidth = 0) +
+  geom_line(linewidth = 1.1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  facet_wrap(~ Period, nrow = 1) +
+  labs(
+    title = "",
+    subtitle = "",
+    x = "Day of Year",
+    y = "Rate of NDVI change (∂NDVI / ∂DOY)",
+    color = "Treatment",
+    fill  = "Treatment"
+  ) +
+  theme_minimal(base_size = 18) +
+  theme(
+    legend.position = "top",
+    strip.text = element_text(face = "bold"),
+    axis.title.y = element_text(margin = margin(r = 10)),
+    plot.title = element_text(face = "bold")
+  )
+
+# Save the plot
+ggsave("./Manuscript/figs/Supplement-Figure-A1-marginal_effects_GAM.png", p_marginal, width = 10, height = 6, dpi = 300)
+
+# Display the plot
+p_marginal
+```
+
+# LMM Fixed effects - Supplement - Full detail
+```{r}
+#write out the fixed effects
+summary_lmm_table <- tidy(lmm, effects = "fixed")
+write.csv(summary_lmm_table,
+          file = "./Manuscript/tables/Supplement-TableA2-lmm_fixed_effects_summary.csv",
+          row.names = FALSE)
+
+```  
+  
+# NDVI Max/Min analysis 
+# Gives a good proxy for canopy vigor per season.
+
+```{r}
+
+ndvi_max_summary <- df %>%
+  group_by(Name, Year, TRT, Period) %>%
+  summarise(
+    NDVImax_mean = mean(ndvi_max, na.rm = TRUE),
+    NDVImax_sd   = sd(ndvi_max, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ndvi_min_summary <- df %>%
+  group_by(Name, Year, TRT, Period) %>%
+  summarise(
+    NDVImin_mean = mean(ndvi_min, na.rm = TRUE),
+    NDVImin_sd   = sd(ndvi_min, na.rm = TRUE),
+    .groups = "drop"
+  )  
+```
+
+
+# Peak canopy greeness
+
+```{r}
+
+lmmplotmax <-ggplot(ndvi_max_summary, aes(x = Period, y = NDVImax_mean, fill = TRT)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.1, alpha = 0.4, size = 2) +
+  labs(
+    x = "Period",
+    y = expression("Mean maximum NDVI (NDVI"[max]*")"),
+    fill = "Treatment",
+    title = ""
+  ) +
+  theme_minimal(base_size = 18) +
+  theme(legend.position = "top")
+```
+
+# Minimum ndvi across the forest treatments
+
+```{r}
+
+lmmplotmin <- ggplot(ndvi_min_summary, aes(x = Period, y = NDVImin_mean, fill = TRT)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.1, alpha = 0.4, size = 2) +
+  labs(
+    x = "Period",
+    y = expression("Mean minimum NDVI (NDVI"[min]*")"),
+    fill = "Treatment",
+    title = ""
+  ) +
+  theme_minimal(base_size = 18) +
+  theme(legend.position = "top")
+lmmplotmin
+```
+
+# Plot the Min/Max
+
+```{r}
+lmmplotmin + lmmplotmax +
+    plot_layout(guides = "collect") + plot_annotation(tag_levels = 'a') & theme(legend.position = "top") 
+ggsave("./Manuscript/figs/Supplement-Figure-A2-ndviminmax.png", width = 12, height = 6, dpi = 300)
+```
